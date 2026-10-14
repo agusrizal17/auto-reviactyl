@@ -56,8 +56,9 @@ MODE="both"
 case "${1:-}" in
   --panel-only) MODE="panel" ;;
   --agent-only) MODE="agent" ;;
+  --domain-only) MODE="domain" ;;
   "")           MODE="both" ;;
-  *) echo "Usage: $0 [--panel-only|--agent-only]"; exit 1 ;;
+  *) echo "Usage: $0 [--panel-only|--agent-only|--domain-only]"; exit 1 ;;
 esac
 
 # ----------------------- PRASYARAKAT -----------------------
@@ -451,6 +452,117 @@ SUDOEOF
   php artisan extensions:list 2>/dev/null | tail -n +2 || true
 }
 
+# ----------------------- DOMAIN + SSL -----------------------
+# Kalau DOMAIN di-set (mis. DOMAIN=panel.domainlo.com), script akan:
+#   1. Validasi A record domain sudah mengarah ke IP server
+#   2. Update APP_URL panel ke https://domain
+#   3. Update nginx server_name
+#   4. Issue SSL via certbot (webroot/ nginx plugin)
+#   5. Update node di panel: fqdn=domain, scheme=https
+#   6. Regenerate config agent + restart agent
+# Kalau DOMAIN kosong → skip, pakai IP (HTTP) seperti biasa.
+
+setup_domain() {
+  [ -z "${DOMAIN:-}" ] && { info "DOMAIN tidak di-set — pakai IP (HTTP)."; return 0; }
+
+  info "Setup domain ${DOMAIN} + SSL..."
+
+  # 1. Validasi DNS
+  local domain_ip
+  domain_ip=$(python3 -c "import socket;print(socket.gethostbyname('${DOMAIN}'))" 2>/dev/null || echo "")
+  if [ -z "$domain_ip" ]; then
+    warn "DNS ${DOMAIN} belum resolve — skip setup domain. Jalankan ulang nanti dengan: bash install.sh --domain-only"
+    return 1
+  fi
+  if [ "$domain_ip" != "$PUBLIC_IP" ]; then
+    warn "DNS ${DOMAIN} mengarah ke ${domain_ip}, bukan IP server (${PUBLIC_IP})."
+    warn "Perbaiki A record dulu, atau pakai flag --force-domain untuk lanjut paksa."
+    [ "${FORCE_DOMAIN:-0}" = "1" ] || return 1
+  fi
+  ok "DNS ${DOMAIN} → ${PUBLIC_IP} valid."
+
+  # 2. Update .env panel
+  cd "${PANEL_DIR}"
+  sed -i "s|^APP_URL=.*|APP_URL=https://${DOMAIN}|" .env
+  php artisan config:clear >/dev/null 2>&1
+
+  # 3. Update nginx server_name
+  sed -i "s|server_name .*;|server_name ${DOMAIN};|" /etc/nginx/sites-available/pterodactyl.conf
+  nginx -t 2>&1 | tail -1
+  systemctl reload nginx
+
+  # 4. Issue SSL
+  info "Issue SSL via certbot untuk ${DOMAIN}..."
+  if certbot --nginx -d "${DOMAIN}" --non-interactive --agree-tos \
+       --register-unsafely-without-email 2>&1 | tail -3; then
+    ok "SSL aktif: https://${DOMAIN}"
+  else
+    warn "Certbot gagal — cek: certbot certificates. Panel masih bisa diakses via HTTP."
+  fi
+
+  # 5. Update node fqdn/scheme via panel API
+  info "Update node-1 ke domain ${DOMAIN} + https..."
+  local COOKIE="/tmp/.ptero_domain_cookie"
+  rm -f "$COOKIE"
+  local CSRF
+  CSRF=$(curl -s -c "$COOKIE" "http://127.0.0.1/auth/login" | grep -oP 'csrf-token" content="\K[^"]+')
+  curl -s -b "$COOKIE" -c "$COOKIE" -X POST "http://127.0.0.1/auth/login" \
+    -H 'Content-Type: application/json' -H 'Accept: application/json' \
+    -H "X-CSRF-TOKEN: ${CSRF}" \
+    --data-raw "{\"user\":\"${ADMIN_EMAIL}\",\"password\":\"${ADMIN_PASSWORD}\",\"remember\":true}" >/dev/null
+  local XSRF
+  XSRF=$(awk '$6=="XSRF-TOKEN"{print $7}' "$COOKIE" | tail -1)
+  XSRF=$(python3 -c "import urllib.parse;print(urllib.parse.unquote('${XSRF}'))")
+  curl -s -b "$COOKIE" -X PATCH "http://127.0.0.1/api/application/nodes/1" \
+    -H 'Accept: application/json' -H 'Content-Type: application/json' -H "X-XSRF-TOKEN: ${XSRF}" \
+    --data-raw "{\"fqdn\":\"${DOMAIN}\",\"scheme\":\"https\"}" -o /dev/null -w "%{http_code}\n"
+  rm -f "$COOKIE"
+
+  # 6. Regenerate config agent (dari panel) + restart
+  info "Regenerate config agent..."
+  sleep 2
+  rm -f "$COOKIE"
+  CSRF=$(curl -s -c "$COOKIE" "http://127.0.0.1/auth/login" | grep -oP 'csrf-token" content="\K[^"]+')
+  curl -s -b "$COOKIE" -c "$COOKIE" -X POST "http://127.0.0.1/auth/login" \
+    -H 'Content-Type: application/json' -H 'Accept: application/json' \
+    -H "X-CSRF-TOKEN: ${CSRF}" \
+    --data-raw "{\"user\":\"${ADMIN_EMAIL}\",\"password\":\"${ADMIN_PASSWORD}\",\"remember\":true}" >/dev/null
+  XSRF=$(awk '$6=="XSRF-TOKEN"{print $7}' "$COOKIE" | tail -1)
+  XSRF=$(python3 -c "import urllib.parse;print(urllib.parse.unquote('${XSRF}'))")
+  curl -s -b "$COOKIE" -H "X-XSRF-TOKEN: ${XSRF}" \
+    "http://127.0.0.1/api/application/nodes/1/configuration" > /tmp/agent-config.json
+  python3 - <<PYEOF
+import json
+cfg = json.load(open('/tmp/agent-config.json'))
+yaml = f"""debug: {str(cfg.get('debug', False)).lower()}
+uuid: {cfg['uuid']}
+token_id: {cfg['token_id']}
+token: {cfg['token']}
+api:
+  host: {cfg['api']['host']}
+  port: {cfg['api']['port']}
+  ssl:
+    enabled: {str(cfg['api']['ssl']['enabled']).lower()}
+    cert: {cfg['api']['ssl']['cert']}
+    key: {cfg['api']['ssl']['key']}
+  upload_limit: {cfg['api']['upload_limit']}
+system:
+  data: {cfg['system']['data']}
+  sftp:
+    bind_port: {cfg['system']['sftp']['bind_port']}
+allowed_mounts: []
+remote: {cfg['remote']}
+"""
+open('${AGENT_CONFIG_DIR}/config.yml','w').write(yaml)
+print("Agent config regenerated.")
+PYEOF
+  systemctl restart agent
+  sleep 2
+  systemctl is-active agent >/dev/null && ok "Agent restart dengan config baru." || warn "Agent gagal restart — cek: journalctl -u agent -n 20"
+  rm -f "$COOKIE"
+  ok "Domain + SSL + node setup selesai."
+}
+
 echo ""
 echo "======================================"
 echo "  REVIASYL PANEL AUTO-INSTALLER"
@@ -463,19 +575,30 @@ echo ""
 case "$MODE" in
   panel) install_panel; setup_nginx; setup_queue; install_extensions ;;
   agent) install_agent ;;
+  domain) setup_domain ;;
   both)  install_panel; setup_nginx; setup_queue; install_extensions; install_agent ;;
 esac
+
+# Domain + SSL + update node (kalau DOMAIN di-set)
+if [ "${DOMAIN_SETUP_DONE:-0}" != "1" ]; then
+  setup_domain && DOMAIN_SETUP_DONE=1 || true
+fi
+
+# Summary — pakai domain kalau ada, kalau nggak IP
+PANEL_URL_DISPLAY="http://${PUBLIC_IP}"
+[ -n "${DOMAIN:-}" ] && PANEL_URL_DISPLAY="https://${DOMAIN}"
 
 echo ""
 echo "======================================"
 ok "SELESAI!"
 echo ""
-echo "  Panel  : http://${PUBLIC_IP}"
+echo "  Panel  : ${PANEL_URL_DISPLAY}"
 echo "  Login  : ${ADMIN_EMAIL} / ${ADMIN_PASSWORD}"
 echo "  Agent  : port ${AGENT_PORT} (systemd: agent)"
 echo "  Queue  : systemd: pteroq"
 echo "  Ext    : egg-changer, proxy-manager, datapack-manager, pacman"
+[ -n "${DOMAIN:-}" ] && echo "  SSL    : aktif (Let's Encrypt)"
 echo ""
 warn "  >>> GANTI password admin setelah login pertama! <<<"
-warn "  >>> Masih HTTP tanpa SSL — pasang domain + certbot kalau mau produksi."
+[ -z "${DOMAIN:-}" ] && warn "  >>> Belum pakai domain — jalankan ulang dengan DOMAIN=xxx.com buat aktifin SSL."
 echo "======================================"
